@@ -1,28 +1,34 @@
 import bpy
 import hashlib
 import numpy as np
-import math
+from typing import List, Literal
 
-from ..preferences import StableDiffusionPreferences
-from ..pil_to_image import *
+from .notify_result import NotifyResult
 from ..prompt_engineering import *
 from ..generator_process import Generator
-from ..generator_process.actions.prompt_to_image import ImageGenerationResult, Pipeline
-from ..generator_process.actions.huggingface_hub import ModelType
+from .. import api
+from .. import image_utils
+from ..generator_process.models.optimizations import Optimizations
+from ..diffusers_backend import DiffusersBackend
+import time
+import math
 
-def bpy_image(name, width, height, pixels, existing_image):
-    if existing_image is not None and (existing_image.size[0] != width or existing_image.size[1] != height):
-        bpy.data.images.remove(existing_image)
-        existing_image = None
-    if existing_image is None:
-        image = bpy.data.images.new(name, width=width, height=height)
-    else:
-        image = existing_image
-        image.name = name
-    image.pixels.foreach_set(pixels)
-    image.pack()
-    image.update()
-    return image
+def get_source_image(context, source: Literal['file', 'open_editor']):
+    match source:
+        case 'file':
+            return context.scene.init_img
+        case 'open_editor':
+            if context.area.type == 'IMAGE_EDITOR':
+                return context.area.spaces.active.image
+            else:
+                init_image = None
+                for area in context.screen.areas:
+                    if area.type == 'IMAGE_EDITOR':
+                        if area.spaces.active.image is not None:
+                            init_image = area.spaces.active.image
+                return init_image
+        case _:
+            raise ValueError(f"unsupported source {repr(source)}")
 
 class DreamTexture(bpy.types.Operator):
     bl_idname = "shade.dream_texture"
@@ -32,12 +38,24 @@ class DreamTexture(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
+        try:
+            prompt = context.scene.dream_textures_prompt
+            backend: api.Backend = prompt.get_backend()
+            backend.validate(prompt.generate_args(context))
+        except:
+            return False
         return Generator.shared().can_use()
 
     def execute(self, context):
+        screen = context.screen
+        scene = context.scene
+        prompt = scene.dream_textures_prompt
+        backend: api.Backend = prompt.get_backend()
+
         history_template = {prop: getattr(context.scene.dream_textures_prompt, prop) for prop in context.scene.dream_textures_prompt.__annotations__.keys()}
         history_template["iterations"] = 1
         history_template["random_seed"] = False
+        
         is_file_batch = context.scene.dream_textures_prompt.prompt_structure == file_batch_structure.id
         file_batch_lines = []
         if is_file_batch:
@@ -47,175 +65,158 @@ class DreamTexture(bpy.types.Operator):
 
         node_tree = context.material.node_tree if hasattr(context, 'material') and hasattr(context.material, 'node_tree') else None
         node_tree_center = np.array(node_tree.view_center) if node_tree is not None else None
+        node_tree_top_left = np.array(context.region.view2d.region_to_view(0, context.region.height)) if node_tree is not None else None
         screen = context.screen
         scene = context.scene
 
-        generated_args = scene.dream_textures_prompt.generate_args()
+        generated_args = scene.dream_textures_prompt.generate_args(context)
         context.scene.seamless_result.update_args(generated_args)
         context.scene.seamless_result.update_args(history_template, as_id=True)
 
-        init_image = None
-        if generated_args['use_init_img']:
-            match generated_args['init_img_src']:
-                case 'file':
-                    init_image = scene.init_img
-                case 'open_editor':
-                    for area in screen.areas:
-                        if area.type == 'IMAGE_EDITOR':
-                            if area.spaces.active.image is not None:
-                                init_image = area.spaces.active.image
-        if init_image is not None:
-            init_image = np.flipud(
-                (np.array(init_image.pixels) * 255)
-                    .astype(np.uint8)
-                    .reshape((init_image.size[1], init_image.size[0], init_image.channels))
-            )
+        def execute_backend(control_images):
+            # Setup the progress indicator
+            bpy.types.Scene.dream_textures_progress = bpy.props.IntProperty(name="", default=0, min=0, max=generated_args.steps)
+            scene.dream_textures_info = "Starting..."
 
-        # Setup the progress indicator
-        def step_progress_update(self, context):
-            if hasattr(context.area, "regions"):
-                for region in context.area.regions:
-                    if region.type == "UI":
-                        region.tag_redraw()
-            return None
-        bpy.types.Scene.dream_textures_progress = bpy.props.IntProperty(name="", default=0, min=0, max=generated_args['steps'], update=step_progress_update)
-        scene.dream_textures_info = "Starting..."
-
-        last_data_block = None
-        def step_callback(_, step_image: ImageGenerationResult):
-            nonlocal last_data_block
-            if step_image.final:
-                return
-            scene.dream_textures_progress = step_image.step
-            if len(step_image.images) > 0:
-                image = step_image.tile_images()
-                last_data_block = bpy_image(f"Step {step_image.step}/{generated_args['steps']}", image.shape[1], image.shape[0], image.ravel(), last_data_block)
-                for area in screen.areas:
-                    if area.type == 'IMAGE_EDITOR':
-                        area.spaces.active.image = last_data_block
-
-        iteration = 0
-        iteration_limit = len(file_batch_lines) if is_file_batch else generated_args['iterations']
-        iteration_square = math.ceil(math.sqrt(iteration_limit))
-        def done_callback(future):
-            nonlocal last_data_block
-            nonlocal iteration
-            if hasattr(gen, '_active_generation_future'):
-                del gen._active_generation_future
-            result: ImageGenerationResult = future.result(last_only=True)
-            for i, result_image in enumerate(result.images):
-                seed = result.seeds[i]
-                image = bpy_image(str(seed), result_image.shape[1], result_image.shape[0], result_image.ravel(), last_data_block)
-                last_data_block = None
-                if node_tree is not None:
-                    nodes = node_tree.nodes
-                    texture_node = nodes.new("ShaderNodeTexImage")
-                    texture_node.image = image
-                    texture_node.location = node_tree_center + ((iteration % iteration_square) * 260, -(iteration // iteration_square) * 297)
-                    nodes.active = texture_node
-                for area in screen.areas:
-                    if area.type == 'IMAGE_EDITOR':
-                        area.spaces.active.image = image
-                scene.dream_textures_prompt.seed = str(seed) # update property in case seed was sourced randomly or from hash
-                # create a hash from the Blender image datablock to use as unique ID of said image and store it in the prompt history
-                # and as custom property of the image. Needs to be a string because the int from the hash function is too large
-                image_hash = hashlib.sha256((np.array(image.pixels) * 255).tobytes()).hexdigest()
-                image['dream_textures_hash'] = image_hash
-                scene.dream_textures_prompt.hash = image_hash
-                history_entry = context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.history.add()
-                for key, value in history_template.items():
-                    setattr(history_entry, key, value)
-                history_entry.seed = str(seed)
-                history_entry.hash = image_hash
-                if is_file_batch:
-                    history_entry.prompt_structure_token_subject = file_batch_lines[iteration]
-                iteration += 1
-            if iteration < iteration_limit and not future.cancelled:
-                generate_next()
-            else:
-                scene.dream_textures_info = ""
-                scene.dream_textures_progress = 0
-
-        def exception_callback(_, exception):
-            scene.dream_textures_info = ""
-            scene.dream_textures_progress = 0
-            if hasattr(gen, '_active_generation_future'):
-                del gen._active_generation_future
-            self.report({'ERROR'}, str(exception))
-            raise exception
-
-        original_prompt = generated_args["prompt"]
-        gen = Generator.shared()
-        def generate_next():
-            batch_size = min(generated_args["optimizations"].batch_size, iteration_limit-iteration)
-            if generated_args['pipeline'] == Pipeline.STABILITY_SDK:
-                # Stability SDK is able to accept a list of prompts, but I can
-                # only ever get it to generate multiple of the first one.
-                batch_size = 1
-            if is_file_batch:
-                generated_args["prompt"] = file_batch_lines[iteration: iteration+batch_size]
-            else:
-                generated_args["prompt"] = [original_prompt] * batch_size
+            # Get any init images
+            try:
+                init_image = get_source_image(context, prompt.init_img_src)
+            except ValueError:
+                init_image = None
             if init_image is not None:
-                match generated_args['init_img_action']:
-                    case 'modify':
-                        models = list(filter(
-                            lambda m: m.model == generated_args['model'],
-                            context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.installed_models
-                        ))
-                        supports_depth = generated_args['pipeline'].depth() and len(models) > 0 and ModelType[models[0].model_type] == ModelType.DEPTH
-                        def require_depth():
-                            if not supports_depth:
-                                raise ValueError("Selected pipeline and model do not support depth conditioning. Please select a different model, such as 'stable-diffusion-2-depth' or change the 'Image Type' to 'Color'.")
-                        match generated_args['modify_action_source_type']:
-                            case 'color':
-                                f = gen.image_to_image(
-                                    image=init_image,
-                                    **generated_args
-                                )
-                            case 'depth_generated':
-                                require_depth()
-                                f = gen.depth_to_image(
-                                    image=init_image,
-                                    depth=None,
-                                    **generated_args,
-                                )
-                            case 'depth_map':
-                                require_depth()
-                                f = gen.depth_to_image(
-                                    image=init_image,
-                                    depth=np.array(scene.init_depth.pixels)
-                                            .astype(np.float32)
-                                            .reshape((scene.init_depth.size[1], scene.init_depth.size[0], scene.init_depth.channels)),
-                                    **generated_args,
-                                )
-                            case 'depth':
-                                require_depth()
-                                f = gen.depth_to_image(
-                                    image=None,
-                                    depth=np.flipud(init_image.astype(np.float32) / 255.),
-                                    **generated_args,
-                                )
-                    case 'inpaint':
-                        f = gen.inpaint(
-                            image=init_image,
-                            **generated_args
-                        )
-                    case 'outpaint':
-                        f = gen.outpaint(
-                            image=init_image,
-                            **generated_args
-                        )
-            else:
-                f = gen.prompt_to_image(
-                    **generated_args,
+                init_image_color_space = "sRGB"
+                if scene.dream_textures_prompt.use_init_img and scene.dream_textures_prompt.modify_action_source_type in ['depth_map', 'depth']:
+                    init_image_color_space = None
+                init_image = image_utils.bpy_to_np(init_image, color_space=init_image_color_space)
+
+            # Callbacks
+            last_data_block = None
+            execution_start = time.time()
+            def step_callback(progress: List[api.GenerationResult]) -> bool:
+                nonlocal last_data_block
+                scene.dream_textures_last_execution_time = f"{time.time() - execution_start:.2f} seconds"
+                scene.dream_textures_progress = progress[-1].progress
+                for area in context.screen.areas:
+                    for region in area.regions:
+                        if region.type == "UI":
+                            region.tag_redraw()
+                image = api.GenerationResult.tile_images(progress)
+                if image is None:
+                    return CancelGenerator.should_continue
+                last_data_block = image_utils.np_to_bpy(image, f"Step {progress[-1].progress}/{progress[-1].total}", last_data_block)
+                for area in screen.areas:
+                    if area.type == 'IMAGE_EDITOR' and not area.spaces.active.use_image_pin:
+                        area.spaces.active.image = last_data_block
+                return CancelGenerator.should_continue
+
+            iteration = 0
+            iteration_limit = len(file_batch_lines) if is_file_batch else generated_args.iterations
+            iteration_square = math.ceil(math.sqrt(iteration_limit))
+            node_pad = np.array((20, 20))
+            node_size = np.array((240, 277)) + node_pad
+            if node_tree is not None:
+                # keep image nodes grid centered but don't go beyond top and left sides of nodes editor
+                node_anchor = node_tree_center + node_size * 0.5 * (-iteration_square, (iteration_limit-1) // iteration_square + 1)
+                node_anchor = np.array((np.maximum(node_tree_top_left[0], node_anchor[0]), np.minimum(node_tree_top_left[1], node_anchor[1]))) + node_pad * (0.5, -0.5)
+            
+            def callback(results: List[api.GenerationResult] | Exception):
+                if isinstance(results, Exception):
+                    scene.dream_textures_info = ""
+                    scene.dream_textures_progress = 0
+                    CancelGenerator.should_continue = None
+                    if not isinstance(results, InterruptedError): # this is a user-initiated cancellation
+                        eval('bpy.ops.' + NotifyResult.bl_idname)('INVOKE_DEFAULT', exception=repr(results))
+                    raise results
+                else:
+                    nonlocal last_data_block
+                    nonlocal iteration
+                    for result in results:
+                        if result.image is None or result.seed is None:
+                            continue
+                        
+                        # Create a trimmed image name
+                        prompt_string = context.scene.dream_textures_prompt.prompt_structure_token_subject
+                        seed_str_length = len(str(result.seed))
+                        trim_aware_name = (prompt_string[:54 - seed_str_length] + '..') if len(prompt_string) > 54 else prompt_string
+                        name_with_trimmed_prompt = f"{trim_aware_name} ({result.seed})"
+                        image = image_utils.np_to_bpy(result.image, name_with_trimmed_prompt, last_data_block)
+                        last_data_block = None
+                        if node_tree is not None:
+                            nodes = node_tree.nodes
+                            texture_node = nodes.new("ShaderNodeTexImage")
+                            texture_node.image = image
+                            texture_node.location = node_anchor + node_size * ((iteration % iteration_square), -(iteration // iteration_square))
+                            nodes.active = texture_node
+                        for area in screen.areas:
+                            if area.type == 'IMAGE_EDITOR' and not area.spaces.active.use_image_pin:
+                                area.spaces.active.image = image
+                        scene.dream_textures_prompt.seed = str(result.seed) # update property in case seed was sourced randomly or from hash
+                        # create a hash from the Blender image datablock to use as unique ID of said image and store it in the prompt history
+                        # and as custom property of the image. Needs to be a string because the int from the hash function is too large
+                        image_hash = hashlib.sha256((np.array(image.pixels) * 255).tobytes()).hexdigest()
+                        image['dream_textures_hash'] = image_hash
+                        scene.dream_textures_prompt.hash = image_hash
+                        history_entry = context.scene.dream_textures_history.add()
+                        for key, value in history_template.items():
+                            match key:
+                                case 'control_nets':
+                                    for net in value:
+                                        n = history_entry.control_nets.add()
+                                        for prop in n.__annotations__.keys():
+                                            setattr(n, prop, getattr(net, prop))
+                                case _:
+                                    setattr(history_entry, key, value)
+                        history_entry.seed = str(result.seed)
+                        history_entry.hash = image_hash
+                        history_entry.width = result.image.shape[1]
+                        history_entry.height = result.image.shape[0]
+                        if is_file_batch:
+                            history_entry.prompt_structure_token_subject = file_batch_lines[iteration]
+                        iteration += 1
+                    if iteration < iteration_limit:
+                        generate_next()
+                    else:
+                        scene.dream_textures_info = ""
+                        scene.dream_textures_progress = 0
+                        CancelGenerator.should_continue = None
+        
+            # Call the backend
+            CancelGenerator.should_continue = True # reset global cancellation state
+            def generate_next():
+                args = prompt.generate_args(context, iteration=iteration, init_image=init_image, control_images=control_images)
+                backend.generate(args, step_callback=step_callback, callback=callback)
+            
+            generate_next()
+        
+        # Prepare ControlNet images
+        if len(prompt.control_nets) > 0:
+            bpy.types.Scene.dream_textures_progress = bpy.props.IntProperty(name="", default=0, min=0, max=len(prompt.control_nets))
+            scene.dream_textures_info = "Processing Control Images..."
+            context.scene.dream_textures_progress = 0
+
+            gen = Generator.shared()
+            optimizations = backend.optimizations() if isinstance(backend, DiffusersBackend) else Optimizations()
+
+            control_images = []
+            def process_next(i):
+                if i >= len(prompt.control_nets):
+                    execute_backend(control_images)
+                    return
+                net = prompt.control_nets[i]
+                future = gen.controlnet_aux(
+                    processor_id=net.processor_id,
+                    image=image_utils.bpy_to_np(net.control_image, color_space=None),
+                    optimizations=optimizations
                 )
-            gen._active_generation_future = f
-            f.call_done_on_exception = False
-            f.add_response_callback(step_callback)
-            f.add_exception_callback(exception_callback)
-            f.add_done_callback(done_callback)
-        generate_next()
+                def on_response(future):
+                    control_images.append(future.result(last_only=True))
+                    context.scene.dream_textures_progress = i + 1
+                    process_next(i + 1)
+                future.add_done_callback(on_response)
+            process_next(0)
+        else:
+            execute_backend(None)
+
         return {"FINISHED"}
 
 def kill_generator(context=bpy.context):
@@ -223,6 +224,7 @@ def kill_generator(context=bpy.context):
     try:
         context.scene.dream_textures_info = ""
         context.scene.dream_textures_progress = 0
+        CancelGenerator.should_continue = None
     except:
         pass
 
@@ -242,14 +244,12 @@ class CancelGenerator(bpy.types.Operator):
     bl_description = "Stops the generator without reloading everything next time"
     bl_options = {'REGISTER'}
 
+    should_continue = None
+
     @classmethod
     def poll(cls, context):
-        gen = Generator.shared()
-        return hasattr(gen, "_active_generation_future") and gen._active_generation_future is not None and not gen._active_generation_future.cancelled and not gen._active_generation_future.done
+        return cls.should_continue is not None
 
     def execute(self, context):
-        gen = Generator.shared()
-        gen._active_generation_future.cancel()
-        context.scene.dream_textures_info = ""
-        context.scene.dream_textures_progress = 0
+        CancelGenerator.should_continue = False
         return {'FINISHED'}

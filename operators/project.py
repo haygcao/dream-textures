@@ -6,24 +6,68 @@ import bmesh
 from bpy_extras import view3d_utils
 import mathutils
 import numpy as np
+from typing import List
 
 from .view_history import ImportPromptFile
-from ..property_groups.dream_prompt import pipeline_options
 from .open_latest_version import OpenLatestVersion, is_force_show_download, new_version_available
 
 from ..ui.panels.dream_texture import advanced_panel, create_panel, prompt_panel, size_panel
 from .dream_texture import CancelGenerator, ReleaseGenerator
-from ..preferences import StableDiffusionPreferences
+from .notify_result import NotifyResult
 
 from ..generator_process import Generator
-from ..generator_process.actions.prompt_to_image import Pipeline
-from ..generator_process.actions.huggingface_hub import ModelType
+from ..generator_process.models import ModelType
+from ..api.models import FixItError
 import tempfile
+
+from ..engine.annotations.depth import render_depth_map
+
+from .. import api
+from .. import image_utils
 
 framebuffer_arguments = [
     ('depth', 'Depth', 'Only provide the scene depth as input'),
     ('color', 'Depth and Color', 'Provide the scene depth and color as input'),
 ]
+
+def _validate_projection(context):
+    if len(context.selected_objects) == 0:
+        def object_mode_operator(operator):
+            operator.mode = 'OBJECT'
+        def select_by_type_operator(operator):
+            operator.type = 'MESH'
+        raise FixItError(
+            """No objects selected
+Select at least one object to project onto.""",
+            FixItError.RunOperator("Switch to Object Mode", "object.mode_set", object_mode_operator)
+            if context.object.mode != 'OBJECT'
+            else FixItError.RunOperator("Select All Meshes", "object.select_by_type", select_by_type_operator)
+        )
+    if context.object is not None and context.object.mode != 'EDIT':
+        def fix_mode(operator):
+            operator.mode = 'EDIT'
+        raise FixItError(
+            """Enter edit mode
+In edit mode, select the faces to project onto.""",
+            FixItError.RunOperator("Switch to Edit Mode", "object.mode_set", fix_mode)
+        )
+    has_selection = False
+    for obj in context.selected_objects:
+        if not hasattr(obj, "data"):
+            continue
+        mesh = bmesh.from_edit_mesh(obj.data)
+        bm = mesh.copy()
+        bm.select_mode = {'FACE'}
+        for f in bm.faces:
+            if f.select:
+                has_selection = True
+                break
+    if not has_selection:
+        raise FixItError(
+            """No faces selected.
+Select at least one face to project onto.""",
+            FixItError.RunOperator("Select All Faces", "mesh.select_all", lambda _: None)
+        )
 
 def dream_texture_projection_panels():
     class DREAM_PT_dream_panel_projection(bpy.types.Panel):
@@ -50,30 +94,14 @@ def dream_texture_projection_panels():
             layout = self.layout
             layout.use_property_split = True
             layout.use_property_decorate = False
-
-            if len(pipeline_options(self, context)) > 1:
-                layout.prop(context.scene.dream_textures_project_prompt, "pipeline")
-            if Pipeline[context.scene.dream_textures_project_prompt.pipeline].model():
-                layout.prop(context.scene.dream_textures_project_prompt, 'model')
             
-            if not Pipeline[context.scene.dream_textures_project_prompt.pipeline].depth():
-                box = layout.box()
-                box.label(text="Unsupported pipeline", icon="ERROR")
-                box.label(text="The selected pipeline does not support depth to image.")
-            
-            models = list(filter(
-                lambda m: m.model == context.scene.dream_textures_project_prompt.model,
-                context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.installed_models
-            ))
-            if len(models) > 0 and ModelType[models[0].model_type] != ModelType.DEPTH:
-                box = layout.box()
-                box.label(text="Unsupported model", icon="ERROR")
-                box.label(text="Select a depth model, such as 'stabilityai/stable-diffusion-2-depth'")
-
             if is_force_show_download():
                 layout.operator(OpenLatestVersion.bl_idname, icon="IMPORT", text="Download Latest Release")
             elif new_version_available():
                 layout.operator(OpenLatestVersion.bl_idname, icon="IMPORT")
+
+            layout.prop(context.scene.dream_textures_project_prompt, "backend")
+            layout.prop(context.scene.dream_textures_project_prompt, 'model')
 
     yield DREAM_PT_dream_panel_projection
 
@@ -94,69 +122,62 @@ def dream_texture_projection_panels():
                 layout = self.layout
                 layout.use_property_split = True
 
+                prompt = get_prompt(context)
+
                 layout.prop(context.scene, "dream_textures_project_framebuffer_arguments")
                 if context.scene.dream_textures_project_framebuffer_arguments == 'color':
-                    layout.prop(get_prompt(context), "strength")
+                    layout.prop(prompt, "strength")
                 
                 col = layout.column()
+                
+                col.prop(context.scene, "dream_textures_project_use_control_net")
+                if context.scene.dream_textures_project_use_control_net and len(prompt.control_nets) > 0:
+                    col.prop(prompt.control_nets[0], "control_net", text="Depth ControlNet")
+                    col.prop(prompt.control_nets[0], "conditioning_scale", text="ControlNet Conditioning Scale")
+
                 col.prop(context.scene, "dream_textures_project_bake")
                 if context.scene.dream_textures_project_bake:
                     for obj in context.selected_objects:
                         col.prop_search(obj.data.uv_layers, "active", obj.data, "uv_layers", text=f"{obj.name} Target UVs")
 
-                row = layout.row()
+                row = layout.row(align=True)
                 row.scale_y = 1.5
+                if CancelGenerator.poll(context):
+                    row.operator(CancelGenerator.bl_idname, icon="SNAP_FACE", text="")
                 if context.scene.dream_textures_progress <= 0:
                     if context.scene.dream_textures_info != "":
-                        row.label(text=context.scene.dream_textures_info, icon="INFO")
+                        disabled_row = row.row(align=True)
+                        disabled_row.operator(ProjectDreamTexture.bl_idname, text=context.scene.dream_textures_info, icon="INFO")
+                        disabled_row.enabled = False
                     else:
-                        r = row.row()
+                        r = row.row(align=True)
                         r.operator(ProjectDreamTexture.bl_idname, icon="MOD_UVPROJECT")
-                        r.enabled = Pipeline[context.scene.dream_textures_project_prompt.pipeline].depth() and context.object is not None and context.object.mode == 'EDIT'
-                        if context.object is not None and context.object.mode != 'EDIT':
-                            box = layout.box()
-                            box.label(text="Enter Edit Mode", icon="ERROR")
-                            box.label(text="In edit mode, select the faces to project onto.")
+                        r.enabled = context.object is not None and context.object.mode == 'EDIT'
                 else:
-                    disabled_row = row.row()
+                    disabled_row = row.row(align=True)
                     disabled_row.use_property_split = True
                     disabled_row.prop(context.scene, 'dream_textures_progress', slider=True)
                     disabled_row.enabled = False
-                if CancelGenerator.poll(context):
-                    row.operator(CancelGenerator.bl_idname, icon="CANCEL", text="")
                 row.operator(ReleaseGenerator.bl_idname, icon="X", text="")
+                
+                # Validation
+                try:
+                    _validate_projection(context)
+                    prompt = context.scene.dream_textures_project_prompt
+                    backend: api.Backend = prompt.get_backend()
+                    args = prompt.generate_args(context)
+                    args.task = api.task.PromptToImage() if context.scene.dream_textures_project_use_control_net else api.task.DepthToImage(None, None, 0)
+                    backend.validate(args)
+                except FixItError as e:
+                    error_box = layout.box()
+                    error_box.use_property_split = False
+                    for i, line in enumerate(e.args[0].split('\n')):
+                        error_box.label(text=line, icon="ERROR" if i == 0 else "NONE")
+                    e._draw(context.scene.dream_textures_project_prompt, context, error_box)
+                except Exception as e:
+                    print(e)
         return ActionsPanel
     yield create_panel('VIEW_3D', 'UI', DREAM_PT_dream_panel_projection.bl_idname, actions_panel, get_prompt)
-
-def draw_depth_map(width, height, context, matrix, projection_matrix):
-    """
-    Generate a depth map for the given matrices.
-    """
-    offscreen = gpu.types.GPUOffScreen(width, height)
-
-    with offscreen.bind():
-        fb = gpu.state.active_framebuffer_get()
-        fb.clear(color=(0.0, 0.0, 0.0, 0.0))
-        gpu.state.depth_test_set('LESS_EQUAL')
-        gpu.state.depth_mask_set(True)
-        with gpu.matrix.push_pop():
-            gpu.matrix.load_matrix(matrix)
-            gpu.matrix.load_projection_matrix(projection_matrix)
-
-            offscreen.draw_view3d(
-                context.scene,
-                context.view_layer,
-                context.space_data,
-                context.region,
-                matrix,
-                projection_matrix,
-                do_color_management=False
-            )
-        depth = np.array(fb.read_depth(0, 0, width, height).to_list())
-        depth = 1 - depth
-        depth = np.interp(depth, [np.ma.masked_equal(depth, 0, copy=False).min(), depth.max()], [0, 1]).clip(0, 1)
-    offscreen.free()
-    return depth
 
 def bake(context, mesh, src, dest, src_uv, dest_uv):
     def bake_shader():
@@ -192,7 +213,7 @@ void main()
 
     buffer = gpu.types.Buffer('FLOAT', width * height * 4, src)
     texture = gpu.types.GPUTexture(size=(width, height), data=buffer, format='RGBA16F')
-
+    
     with offscreen.bind():
         fb = gpu.state.active_framebuffer_get()
         fb.clear(color=(0.0, 0.0, 0.0, 0.0))
@@ -222,6 +243,15 @@ class ProjectDreamTexture(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
+        try:
+            _validate_projection(context)
+            prompt = context.scene.dream_textures_project_prompt
+            backend: api.Backend = prompt.get_backend()
+            args = prompt.generate_args(context)
+            args.task = api.task.PromptToImage() if context.scene.dream_textures_project_use_control_net else api.task.DepthToImage(None, None, 0)
+            backend.validate(args)
+        except:
+            return False
         return Generator.shared().can_use()
 
     @classmethod
@@ -287,7 +317,8 @@ class ProjectDreamTexture(bpy.types.Operator):
         material = bpy.data.materials.new(name="diffused-material")
         material.use_nodes = True
         image_texture_node = material.node_tree.nodes.new("ShaderNodeTexImage")
-        material.node_tree.links.new(image_texture_node.outputs[0], material.node_tree.nodes['Principled BSDF'].inputs[0])
+        principled_node = next((n for n in material.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'))
+        material.node_tree.links.new(image_texture_node.outputs[0], principled_node.inputs[0])
         uv_map_node = material.node_tree.nodes.new("ShaderNodeUVMap")
         uv_map_node.uv_map = bpy.context.selected_objects[0].data.uv_layers.active.name if context.scene.dream_textures_project_bake else "Projected UVs"
         material.node_tree.links.new(uv_map_node.outputs[0], image_texture_node.inputs[0])
@@ -309,6 +340,7 @@ class ProjectDreamTexture(bpy.types.Operator):
             uv_layer, uv_layer_index = ProjectDreamTexture.get_uv_layer(mesh)
 
             bm = mesh.copy()
+            bm.select_mode = {'FACE'}
             bmesh.ops.split_edges(bm, edges=bm.edges)
             bmesh.ops.delete(bm, geom=[f for f in bm.faces if not f.select], context='FACES')
             target_objects.append((bm, bm.loops.layers.uv[uv_layer_index]))
@@ -326,75 +358,75 @@ class ProjectDreamTexture(bpy.types.Operator):
 
         context.scene.dream_textures_info = "Rendering viewport depth..."
 
-        depth = draw_depth_map(region_width, region_height, context, context.space_data.region_3d.view_matrix, context.space_data.region_3d.window_matrix)
-        
-        gen = Generator.shared()
+        depth = np.flipud(render_depth_map(
+            context.evaluated_depsgraph_get(),
+            collection=None,
+            width=region_width,
+            height=region_height,
+            matrix=context.space_data.region_3d.view_matrix,
+            projection_matrix=context.space_data.region_3d.window_matrix,
+            main_thread=True
+        ))
         
         texture = None
 
-        def on_response(_, response):
+        def step_callback(progress: List[api.GenerationResult]) -> bool:
             nonlocal texture
-            if response.final:
-                return
-            context.scene.dream_textures_progress = response.step
-            if texture is None:
-                texture = bpy.data.images.new(name="Step", width=response.images[0].shape[1], height=response.images[0].shape[0])
-            texture.name = f"Step {response.step}/{context.scene.dream_textures_project_prompt.steps}"
-            texture.pixels[:] = response.images[0].ravel()
-            texture.update()
+            context.scene.dream_textures_progress = progress[-1].progress
+            image = api.GenerationResult.tile_images(progress)
+            texture = image_utils.np_to_bpy(image, f"Step {progress[-1].progress}/{progress[-1].total}", texture)
             image_texture_node.image = texture
+            return CancelGenerator.should_continue
 
-        def on_done(future):
-            nonlocal texture
-            if hasattr(gen, '_active_generation_future'):
-                del gen._active_generation_future
-            context.scene.dream_textures_info = ""
-            context.scene.dream_textures_progress = 0
-            generated = future.result()
-            if isinstance(generated, list):
-                generated = generated[-1]
-            if texture is None:
-                texture = bpy.data.images.new(name=str(generated.seeds[0]), width=generated.images[0].shape[1], height=generated.images[0].shape[0])
-            texture.name = str(generated.seeds[0])
-            material.name = str(generated.seeds[0])
-            texture.pixels[:] = generated.images[0].ravel()
-            texture.update()
-            texture.pack()
-            image_texture_node.image = texture
-            if context.scene.dream_textures_project_bake:
-                for bm, src_uv_layer in target_objects:
-                    dest = bpy.data.images.new(name=f"{texture.name} (Baked)", width=texture.size[0], height=texture.size[1])
-                    
-                    dest_uv_layer = bm.loops.layers.uv.active
-                    src_uvs = np.empty((len(bm.verts), 2), dtype=np.float32)
-                    dest_uvs = np.empty((len(bm.verts), 2), dtype=np.float32)
-                    for face in bm.faces:
-                        for loop in face.loops:
-                            src_uvs[loop.vert.index] = loop[src_uv_layer].uv
-                            dest_uvs[loop.vert.index] = loop[dest_uv_layer].uv
-                    bake(context, bm, generated.images[0].ravel(), dest, src_uvs, dest_uvs)
-                    dest.update()
-                    dest.pack()
-                    image_texture_node.image = dest
+        def callback(results: List[api.GenerationResult] | Exception):
+            CancelGenerator.should_continue = None
+            if isinstance(results, Exception):
+                context.scene.dream_textures_info = ""
+                context.scene.dream_textures_progress = 0
+                if not isinstance(results, InterruptedError): # this is a user-initiated cancellation
+                    eval('bpy.ops.' + NotifyResult.bl_idname)('INVOKE_DEFAULT', exception=repr(results))
+                raise results
+            else:
+                nonlocal texture
+                context.scene.dream_textures_info = ""
+                context.scene.dream_textures_progress = 0
+                result = results[-1]
+                prompt_subject = context.scene.dream_textures_project_prompt.prompt_structure_token_subject
+                seed_str_length = len(str(result.seed))
+                trim_aware_name = (prompt_subject[:54 - seed_str_length] + '..') if len(prompt_subject) > 54 else prompt_subject
+                name_with_trimmed_prompt = f"{trim_aware_name} ({result.seed})"
+
+                texture = image_utils.np_to_bpy(result.image, name_with_trimmed_prompt, texture)
+                image_texture_node.image = texture
+                if context.scene.dream_textures_project_bake:
+                    for bm, src_uv_layer in target_objects:
+                        dest = bpy.data.images.new(name=f"{texture.name} (Baked)", width=texture.size[0], height=texture.size[1])
+                        
+                        dest_uv_layer = bm.loops.layers.uv.active
+                        src_uvs = np.empty((len(bm.verts), 2), dtype=np.float32)
+                        dest_uvs = np.empty((len(bm.verts), 2), dtype=np.float32)
+                        for face in bm.faces:
+                            for loop in face.loops:
+                                src_uvs[loop.vert.index] = loop[src_uv_layer].uv
+                                dest_uvs[loop.vert.index] = loop[dest_uv_layer].uv
+                        bake(context, bm, result.image.ravel(), dest, src_uvs, dest_uvs)
+                        dest.update()
+                        dest.pack()
+                        image_texture_node.image = dest
         
-        def on_exception(_, exception):
-            context.scene.dream_textures_info = ""
-            context.scene.dream_textures_progress = 0
-            if hasattr(gen, '_active_generation_future'):
-                del gen._active_generation_future
-            raise exception
-        
+        backend: api.Backend = context.scene.dream_textures_project_prompt.get_backend()
+
         context.scene.dream_textures_info = "Starting..."
-        future = gen.depth_to_image(
-            depth=depth,
-            image=init_img_path,
-            **context.scene.dream_textures_project_prompt.generate_args()
-        )
-        gen._active_generation_future = future
-        future.call_done_on_exception = False
-        future.add_response_callback(on_response)
-        future.add_done_callback(on_done)
-        future.add_exception_callback(on_exception)
+        CancelGenerator.should_continue = True # reset global cancellation state
+        image_data = bpy.data.images.load(init_img_path) if init_img_path is not None else None
+        image = np.asarray(image_data.pixels).reshape((*depth.shape, image_data.channels)) if image_data is not None else None
+        if context.scene.dream_textures_project_use_control_net:
+            generated_args: api.GenerationArguments = context.scene.dream_textures_project_prompt.generate_args(context, init_image=image, control_images=[image_utils.rgba(depth)])
+            backend.generate(generated_args, step_callback=step_callback, callback=callback)
+        else:
+            generated_args: api.GenerationArguments = context.scene.dream_textures_project_prompt.generate_args(context)
+            generated_args.task = api.DepthToImage(depth, image, context.scene.dream_textures_project_prompt.strength)
+            backend.generate(generated_args, step_callback=step_callback, callback=callback)
 
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':

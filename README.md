@@ -23,37 +23,37 @@ If you want a visual guide to installation, see this video tutorial from Ashlee 
 
 Here's a few quick guides:
 
-## [Setting Up](docs/SETUP.md)
+## [Setting Up](https://github.com/carson-katri/dream-textures/wiki/Setup)
 Setup instructions for various platforms and configurations.
 
-## [Image Generation](docs/IMAGE_GENERATION.md)
+## [Image Generation](https://github.com/carson-katri/dream-textures/wiki/Image-Generation)
 Create textures, concept art, and more with text prompts. Learn how to use the various configuration options to get exactly what you're looking for.
 
 ![A graphic showing each step of the image generation process](docs/assets/image_generation.png)
 
-## [Texture Projection](docs/TEXTURE_PROJECTION.md)
+## [Texture Projection](https://github.com/carson-katri/dream-textures/wiki/Texture-Projection)
 Texture entire models and scenes with depth to image.
 
 ![A graphic showing each step of the texture projection process](docs/assets/texture_projection.png)
 
-## [Inpaint/Outpaint](docs/INPAINT_OUTPAINT.md)
+## [Inpaint/Outpaint](https://github.com/carson-katri/dream-textures/wiki/Inpaint-and-Outpaint)
 Inpaint to fix up images and convert existing textures into seamless ones automatically.
 
 Outpaint to increase the size of an image by extending it in any direction.
 
 ![A graphic showing each step of the outpainting process](docs/assets/inpaint_outpaint.png)
 
-## [Render Pass](docs/RENDER_PASS.md)
-Perform style transfer and create novel animations with Stable Diffusion as a post processing step.
+## [Render Engine](https://github.com/carson-katri/dream-textures/wiki/Render-Engine)
+Use the Dream Textures node system to create complex effects.
 
-![A graphic showing each frame of a render pass, split with the original and generated result](docs/assets/render_pass.png)
+![A graphic showing each frame of a render, split with the scene and generated result](docs/assets/render_pass.png)
 
-## [AI Upscaling](docs/AI_UPSCALING.md)
+## [AI Upscaling](https://github.com/carson-katri/dream-textures/wiki/AI-Upscaling)
 Upscale your low-res generations 4x.
 
 ![A graphic showing each step of the upscaling process](docs/assets/upscale.png)
 
-## [History](docs/HISTORY.md)
+## [History](https://github.com/carson-katri/dream-textures/wiki/History)
 Recall, export, and import history entries for later use.
 
 # Compatibility
@@ -65,26 +65,7 @@ If you have an issue with a supported GPU, please create an issue.
 If your hardware is unsupported, you can use DreamStudio to process in the cloud. Follow the instructions in the release notes to setup with DreamStudio.
 
 # Contributing
-After cloning the repository, there a few more steps you need to complete to setup your development environment:
-1. Install submodules:
-```sh
-git submodule update --init --recursive
-```
-2. I recommend the [Blender Development](https://marketplace.visualstudio.com/items?itemName=JacquesLucke.blender-development) extension for VS Code for debugging. If you just want to install manually though, you can put the `dream_textures` repo folder in Blender's addon directory.
-3. After running the local add-on in Blender, setup the model weights like normal.
-4. Install dependencies locally
-    * Open Blender's preferences window
-    * Enable *Interface* > *Display* > *Developer Extras*
-    * Then install dependencies for development under *Add-ons* > *Dream Textures* > *Development Tools*
-    * This will download all pip dependencies for the selected platform into `.python_dependencies`
-
-
-### macOS
-
-1. On Apple Silicon, with the `requirements-dream-studio.txt` you may run into an error with gRPC using an incompatible binary. If so, please use the following command to install the correct gRPC version:
-```sh
-pip install --no-binary :all: grpcio --ignore-installed --target .python_dependencies --upgrade
-```
+For detailed instructions on installing from source, see the guide on [setting up a development environment](https://github.com/carson-katri/dream-textures/wiki/Setting-Up-a-Development-Environment).
 
 # Troubleshooting
 

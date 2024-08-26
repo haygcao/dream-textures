@@ -1,0 +1,19 @@
+diffusers==0.27.2
+invisible-watermark
+transformers
+accelerate
+huggingface_hub
+controlnet-aux==0.0.7
+
+torch-directml
+torch==2.3.1
+
+# Original SD checkpoint conversion
+pytorch-lightning
+tensorboard
+omegaconf
+
+scipy # LMSDiscreteScheduler
+
+opencolorio==2.3.2 # color management
+matplotlib

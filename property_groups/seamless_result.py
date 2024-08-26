@@ -4,7 +4,8 @@ import numpy as np
 from ..generator_process.actions.detect_seamless import SeamlessAxes
 from ..generator_process import Generator
 from ..preferences import StableDiffusionPreferences
-
+from ..api.models import GenerationArguments
+from .. import image_utils
 
 def update(self, context):
     if hasattr(context.area, "regions"):
@@ -29,7 +30,7 @@ class SeamlessResult(bpy.types.PropertyGroup):
             def hash_init():
                 self.image = image
                 self.result = res
-            for args in bpy.context.preferences.addons[StableDiffusionPreferences.bl_idname].preferences.history:
+            for args in bpy.context.scene.dream_textures_history:
                 if args.get('hash', None) == hash_string and args.seamless_axes != SeamlessAxes.AUTO:
                     res = SeamlessAxes(args.seamless_axes).text
                     bpy.app.timers.register(hash_init)
@@ -44,17 +45,22 @@ class SeamlessResult(bpy.types.PropertyGroup):
 
         if not can_process:
             return
-        pixels = np.empty(image.size[0]*image.size[1]*4, dtype=np.float32)
-        image.pixels.foreach_get(pixels)
-        pixels = pixels.reshape(image.size[1], image.size[0], -1)
+        pixels = image_utils.bpy_to_np(image)
 
         def result(future):
             self.result = future.result().text
         Generator.shared().detect_seamless(pixels).add_done_callback(result)
 
-    def update_args(self, args: dict[str, any], as_id=False):
-        if args['seamless_axes'] == SeamlessAxes.AUTO and self.result != 'Processing':
-            if as_id:
-                args['seamless_axes'] = SeamlessAxes(self.result).id
-            else:
-                args['seamless_axes'] = SeamlessAxes(self.result)
+    def update_args(self, args, as_id=False):
+        if isinstance(args, GenerationArguments):
+            if args.seamless_axes == SeamlessAxes.AUTO and self.result != 'Processing':
+                if as_id:
+                    args.seamless_axes = SeamlessAxes(self.result).id
+                else:
+                    args.seamless_axes = SeamlessAxes(self.result)
+        else:
+            if args['seamless_axes'] == SeamlessAxes.AUTO and self.result != 'Processing':
+                if as_id:
+                    args['seamless_axes'] = SeamlessAxes(self.result).id
+                else:
+                    args['seamless_axes'] = SeamlessAxes(self.result)
